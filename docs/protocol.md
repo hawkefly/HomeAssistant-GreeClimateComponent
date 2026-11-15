@@ -183,3 +183,15 @@ It needs a later full status push with the new temperature to print
 still contain fields that are not mapped, so this is a test tool, not an
 automatic profile for every unit with the same model id. `--protocol json`
 can test the existing property command path under the same state checks.
+
+
+The exact U-WB05_TGV1.30 firmware was later checked offline. Its `binCmd`
+handler decodes the full `hex01` frame, sets byte 7 to `0xaf` and sends it to
+the controller. It does not read `fragment` or the supplied `hex6A`. This
+means a changed fragment list alone cannot preserve unrelated device state.
+Keep the template checks in the live test. `ReportClientID` is optional.
+The same firmware handles `freqCount` with `SendFreq` and `FreqTime`; the
+captured `[1, 300]` request schedules a full report. The live test sends that
+request before waiting for initial state. It may not receive a separate
+response reply. The listener is registered before subscribing so that an
+early retained report is not lost.
