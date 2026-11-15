@@ -11,12 +11,14 @@ from typing import Any, NamedTuple
 
 from pydantic import BaseModel, ConfigDict
 
+from .binary_ac import BinaryAcError, build_bin_cmd
 from .cipher import CipherBase, EncryptionVersion, get_cipher
 from .cloud_api import GreeCloudApi
 from .const import DEFAULT_DEVICE_PORT, DEFAULT_DEVICE_USERID, MAX_PACK_SIZE
 from .errors import GreeBindingError, GreeConnectionError, GreeError, GreeProtocolError
 from .helpers import gree_extract_macs, redact_str
 from .transport import BindingInfo, GreeBaseTransport
+from .transport_mqtt import GreeMqttTransport
 from .transport_udp import GreeUdpTransport, async_udp_broadcast_request
 
 _LOGGER = logging.getLogger(__name__)
@@ -1290,6 +1292,44 @@ async def gree_set_status(
         )
 
     return updated_props
+
+
+async def gree_set_binary_status(
+    mac_addr_controller: str,
+    mac_addr: str,
+    uid: int,
+    prop_values: Mapping[str, int],
+    template: bytes,
+    hex6a: bytes,
+    cipher: CipherBase,
+    transport: GreeBaseTransport,
+) -> None:
+    """Submit an experimental binary command over MQTT with the device key.
+
+    The caller supplies model-matched network command and profile frames.
+    A res/r=200 reply means acceptance only. Wait for a later status push to
+    confirm the device state. This function never returns proposed state.
+    """
+    if not isinstance(transport, GreeMqttTransport):
+        raise GreeProtocolError("Binary AC commands require the MQTT transport")
+    if cipher.version != EncryptionVersion.V1:
+        raise GreeProtocolError("Binary MQTT commands require V1 encryption")
+    try:
+        pack = build_bin_cmd(prop_values, template=template, hex6a=hex6a)
+    except BinaryAcError as err:
+        raise GreeProtocolError("Invalid binary AC command") from err
+    pack["mac"] = mac_addr
+    payload = _create_payload(pack, "pack", 0, mac_addr_controller, uid)
+    result = await gree_get_response_pack(
+        mac_addr_controller, payload, cipher, transport, max_attempts=1
+    )
+    if (
+        not isinstance(result, dict)
+        or result.get("t") != "res"
+        or not isinstance(result.get("r"), int)
+        or result["r"] != 200
+    ):
+        raise GreeProtocolError("Binary AC command was not accepted")
 
 
 async def _gree_get_scan(

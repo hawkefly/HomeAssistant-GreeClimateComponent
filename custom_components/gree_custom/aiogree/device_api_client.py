@@ -15,6 +15,7 @@ from .api import (
     gree_set_status,
     gree_try_bind,
 )
+from .binary_ac import BinaryAcError, decode_bin_status
 from .cipher import CipherBase, EncryptionVersion, get_cipher
 from .const import (
     MIN_PACK_PROPS,
@@ -47,6 +48,7 @@ class DeviceApiClient:
         self._available = False
 
         self._listeners: list[Callable[[dict[str, str]], None]] = []
+        self._binary_status_enabled = False
 
         # How many columns one status request may carry on this device.
         # Measured once by probe_device_limits() right after binding.
@@ -424,6 +426,14 @@ class DeviceApiClient:
     # Transport Push Messages
     #
 
+    def enable_binary_status(self) -> None:
+        """Enable the experimental binary layout for a matched device model.
+
+        This only changes status push decoding. It does not enable binary
+        commands or change the normal property requests.
+        """
+        self._binary_status_enabled = True
+
     def add_status_listener(
         self,
         callback: Callable[[dict[str, str]], None],
@@ -456,19 +466,30 @@ class DeviceApiClient:
             return
 
         response = gree_decrypt_pack(
-            payload,
+            payload.copy(),
             self.cipher,
         )
 
         if pack := response.get("pack"):
-            result = gree_process_status_pack(
-                pack,
-                None,
-            )
+            if (
+                self._binary_status_enabled
+                and pack.get("t") == "binStatus"
+                and isinstance(pack.get("binStatus"), str)
+            ):
+                try:
+                    decoded = decode_bin_status(pack["binStatus"])
+                except BinaryAcError:
+                    _LOGGER.debug("Ignoring invalid binary AC status")
+                    return
+                values = {key: str(value) for key, value in decoded.properties.items()}
+            elif "cols" in pack and "dat" in pack:
+                values = gree_process_status_pack(pack, None).prop_values
+            else:
+                return
 
             for listener in self._listeners:
                 try:
-                    listener(result.prop_values)
+                    listener(values)
                 except Exception:
                     _LOGGER.exception("Error during listener execution")
 

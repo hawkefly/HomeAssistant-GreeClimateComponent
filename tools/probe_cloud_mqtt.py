@@ -9,8 +9,11 @@ entered at the terminal. They are not saved or printed.
 
 import argparse
 import asyncio
+import base64
 from getpass import getpass
+import json
 import logging
+import os
 from pathlib import Path
 import sys
 
@@ -26,7 +29,9 @@ from aiogree.helpers import gree_decrypt_pack
 from aiogree.transport_mqtt import GreeMqttTransport
 
 
-async def probe(region: GreeRegion, mac: str, listen_seconds: int) -> None:
+async def probe(
+    region: GreeRegion, mac: str, listen_seconds: int, capture: Path | None = None
+) -> None:
     """Find the device in the account, query it and watch its status topics."""
     username = (await asyncio.to_thread(input, "Gree account: ")).strip()
     password = await asyncio.to_thread(getpass, "Gree password: ")
@@ -40,19 +45,56 @@ async def probe(region: GreeRegion, mac: str, listen_seconds: int) -> None:
 
         print(f"Found {device.mac}; firmware {device.ver}.")
         cipher = get_cipher(EncryptionVersion.V1, device.key)
+
+        def save(name: str, value: dict) -> None:
+            if capture is None:
+                return
+            capture.mkdir(mode=0o700, parents=True, exist_ok=True)
+            descriptor = os.open(
+                capture / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+            with os.fdopen(descriptor, "w") as stream:
+                json.dump(value, stream, ensure_ascii=False)
+
+        save(
+            "device-private.json",
+            {
+                "mac": device.mac,
+                "controller": device.mac_controller_mqtt,
+                "firmware": device.ver,
+                "key": device.key,
+            },
+        )
         transport = GreeMqttTransport(
             str(credentials.user_id), credentials.token, region
         )
 
+        sequence = 0
+
         def pushed(topic: str, envelope: dict) -> None:
             """Show the topic and pack fields without printing secret values."""
+            nonlocal sequence
+            sequence += 1
+            save(f"push-{sequence:04d}.json", {"topic": topic, "envelope": envelope})
             try:
-                response = gree_decrypt_pack(envelope, cipher)
+                push_cipher = (
+                    get_cipher(EncryptionVersion.V1, None)
+                    if envelope.get("i") == 1
+                    else cipher
+                )
+                response = gree_decrypt_pack(envelope.copy(), push_cipher)
                 pack = response.get("pack")
                 fields = sorted(pack) if isinstance(pack, dict) else []
                 print(f"Push {topic.split('/', maxsplit=1)[0]}: fields {fields}")
             except Exception as err:  # noqa: BLE001 - keep listening for the next push
-                print(f"Push could not be decoded: {type(err).__name__}")
+                encoded = envelope.get("pack")
+                count = (
+                    len(base64.b64decode(encoded)) if isinstance(encoded, str) else 0
+                )
+                print(
+                    f"Push {topic.split('/', maxsplit=1)[0]} could not be decoded: "
+                    f"{type(err).__name__}; ciphertext bytes={count}"
+                )
 
         try:
             await transport.add_device(mac, device.mac_controller_mqtt, pushed)
@@ -80,6 +122,12 @@ def main() -> None:
     parser.add_argument(
         "--listen", type=int, default=15, help="Seconds to watch pushes"
     )
+    parser.add_argument(
+        "--capture",
+        type=Path,
+        help="Save device key and encrypted pushes locally for offline analysis; "
+        "use a new private directory and do not upload its contents",
+    )
     args = parser.parse_args()
     if not 0 <= args.listen <= 300:
         parser.error("--listen must be between 0 and 300")
@@ -88,7 +136,7 @@ def main() -> None:
     # own results, and never dumps account responses or device keys.
     logging.disable(logging.CRITICAL)
     try:
-        asyncio.run(probe(GreeRegion[args.region], mac, args.listen))
+        asyncio.run(probe(GreeRegion[args.region], mac, args.listen, args.capture))
     except Exception as err:  # noqa: BLE001 - server exceptions may contain secrets
         print(f"Probe failed: {type(err).__name__}")
         sys.exit(1)

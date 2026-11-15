@@ -138,9 +138,48 @@ MACs are written in lower case with no separators. Talking to a device needs two
 ## Cloud
 
 - Login and device list go over HTTPS to a regional `*grih.gree.com` host. Control goes over MQTT to the matching `mqtt-*.gree.com` broker. Both are picked from `GreeRegion`.
-- This experimental branch uses `mqtt.gree.com` on TLS port 1984 for mainland China. The previous `mqtt-cn.gree.com` entry did not resolve during this investigation. The replacement resolved and completed a TLS handshake with a valid Gree certificate. This makes it a candidate endpoint; account access and device control still need a real account test. The header of [greeclimate 1.0.1](https://github.com/davo22/greeclimate/blob/1.0.1/greeclimate/mqtt_client.py) also names this host, but that source does not have a mainland region mapping.
+- This experimental branch uses `mqtt.gree.com` on TLS port 1984 for mainland China. The previous `mqtt-cn.gree.com` entry did not resolve during this investigation. The replacement resolved and completed a TLS handshake with a valid Gree certificate. A real China account test has now confirmed login, device discovery, device-key retrieval and decoded status pushes. Newly generated control commands still need a device test. The header of [greeclimate 1.0.1](https://github.com/davo22/greeclimate/blob/1.0.1/greeclimate/mqtt_client.py) also names this host, but that source does not have a mainland region mapping.
 - The MQTT transport sends each request once. There are no retries at the transport level.
 - Pushed status can arrive on `status/<controller>` or `binStatus/<controller>`, with optional topic suffixes. The latter was seen in a capture from a mainland China unit that did not answer local discovery. Topic names are case sensitive. Both go through the existing pack decryption and `gree_process_status_pack()` when the decrypted pack contains `cols` and `dat`.
 - A `binStatus` push does not complete a pending request. Only `response/<controller>` for the pending controller does that. A reply from another controller is ignored.
-- The capture alone does not reveal the device key or the decrypted `binStatus` layout. The new topic path is tested with synthetic encrypted status packs. It still needs a test with that real unit and its cloud account.
+- The account test supplied the device key locally. It decrypted all 41 device messages in the capture, including 12 real binary reports. The broker also sends full `cols/dat` status pushes to the app. A plain property query on this V3.5.M unit returned zeros for all four requested fields while full pushes reported valid state. Do not use those query zeros as device state. The normal client does not yet handle this difference.
 - The bytes before the JSON on a device's cloud connection can be MQTT framing: a PUBLISH header, variable-length remaining size, topic and optional packet identifier. Do not send those bytes to UDP 7000. One MQTT message can span several TCP packets.
+
+### Experimental binary AC commands
+
+`aiogree.binary_ac` reads Base64 `binStatus` reports and builds the captured
+`binCmd` format. Status payloads contain several `7e7e` frames. Their length is
+byte 2 plus 3. A command's `hex6A` profile frame uses a different length rule.
+These are network frames with zero checksum fields, not complete UART packets.
+
+`gree_set_binary_status()` is a separate experimental API. It requires MQTT
+and a V1 device cipher. The caller must supply a command template and `hex6A`
+frame matched to the device model. It is not used by the normal device client.
+The codec supports power, mode, whole Celsius target temperature, automatic
+fan speed and both swing fields. Other fan speeds, fractional temperatures
+and unknown properties are rejected. The extra temperature bit is kept as
+raw data when reading state; its meaning is not yet confirmed for this model.
+`TemSen` is returned as its raw sensor byte. The existing temperature offset
+resolver must handle its offset, as it does for JSON status.
+
+Binary push decoding is off by default. A caller may use
+`DeviceApiClient.enable_binary_status()` after it has matched the device model
+to this layout. That enables only pushed status. Normal queries and commands
+keep their existing format. JSON `cols`/`dat` pushes still work. The client
+decrypts a copy of the envelope, so several listeners can read the same push.
+
+The API returns `None` after a `res` reply with integer `r=200`. That reply
+means the module accepted the command. It does not prove that the air
+conditioner changed state. The caller must wait for a later status push and
+compare the reported values. It must not update state from the command alone.
+
+
+Use `tools/probe_binary_ac.py --capture <private-directory> --temperature 26`
+to preview a whole-degree command from the local capture. Add `--send` only
+for a live test. The script checks the account device identity, firmware,
+model, hardware id and known power/mode/fan/swing state before sending once.
+It needs a later full status push with the new temperature to print
+`CONFIRMED`. It does not save login credentials. The captured template can
+still contain fields that are not mapped, so this is a test tool, not an
+automatic profile for every unit with the same model id. `--protocol json`
+can test the existing property command path under the same state checks.
