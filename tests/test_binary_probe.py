@@ -1,7 +1,9 @@
 """Checks for the live test's stale-template and push-confirmation guards."""
 
 import asyncio
+import base64
 import importlib.util
+import json
 from pathlib import Path
 
 from aiogree.binary_ac import BinaryAcError
@@ -55,3 +57,31 @@ async def test_changed_temperature_with_other_state_change_is_rejected() -> None
     pushes.put_nowait({**BEFORE, "SetTem": "26", "Pow": "0"})
     with pytest.raises(BinaryAcError, match="another known field"):
         await PROBE.confirm_temperature(pushes, EXPECTED, 26, 1)
+
+
+@pytest.mark.parametrize("power", [0, 1])
+def test_template_selection_preserves_live_power(tmp_path: Path, power: int) -> None:
+    """Select an actual captured state instead of replacing the live power bit."""
+    (tmp_path / "device-private.json").write_text(json.dumps({"mac": "test"}))
+    rows = []
+    for captured_power in (1, 0):
+        raw = bytearray(50)
+        raw[:4] = b"~~\x2f\x01"
+        raw[8] = 0x10 | captured_power << 7
+        raw[9] = 0xA0
+        raw[12] = 0x10
+        raw[22] = 8
+        pack = {
+            "t": "binCmd",
+            "hex01": base64.b64encode(raw).decode(),
+            "hex6A": base64.b64encode(b"~~\x13\x6a" + bytes(17)).decode(),
+        }
+        encoded = json.dumps(pack).encode()
+        # Use both supported JSON-only and padded capture representations.
+        if captured_power == 0:
+            padding = 16 - len(encoded) % 16
+            encoded += bytes([padding]) * padding
+        rows.append({"kind": "request", "raw_hex": encoded.hex()})
+    (tmp_path / "pcap-decrypted-private.json").write_text(json.dumps(rows))
+    _, template, _ = PROBE.load_template(tmp_path, {**EXPECTED, "Pow": str(power)})
+    assert (template[8] >> 7) & 1 == power

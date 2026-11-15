@@ -32,8 +32,10 @@ from aiogree.helpers import gree_decrypt_pack
 from aiogree.transport_mqtt import GreeMqttTransport
 
 
-def load_template(capture: Path) -> tuple[dict, bytes, bytes]:
-    """Select the last whole-degree temperature command in a private capture."""
+def load_template(
+    capture: Path, live_state: dict[str, str] | None = None
+) -> tuple[dict, bytes, bytes]:
+    """Select a captured whole-degree command that matches known live fields."""
     identity = json.loads((capture / "device-private.json").read_text())
     rows = json.loads((capture / "pcap-decrypted-private.json").read_text())
     candidates = []
@@ -46,17 +48,26 @@ def load_template(capture: Path) -> tuple[dict, bytes, bytes]:
         pack = json.loads(raw.rstrip(b"\0"))
         if pack.get("t") != "binCmd":
             continue
-        fragments = pack.get("fragment", [])
-        if not any(record[:3] == [1, 6, 240] for record in fragments):
-            continue
         template = base64.b64decode(pack["hex01"], validate=True)
-        if template[14] & 8:
+        if (
+            len(template) != 50
+            or template[14] & 8
+            or template[8] & 3
+            or template[22] & 7
+        ):
+            continue
+        known = template_state(template)
+        if live_state is not None and any(
+            live_state.get(k) != v for k, v in known.items()
+        ):
             continue
         hex6a = base64.b64decode(pack["hex6A"], validate=True)
         build_bin_cmd({"SetTem": 26}, template=template, hex6a=hex6a)
         candidates.append((template, hex6a))
     if not candidates:
-        raise BinaryAcError("No captured whole-degree command template")
+        raise BinaryAcError(
+            "No captured whole-degree auto-fan template matches the live state"
+        )
     return identity, *candidates[-1]
 
 
@@ -155,6 +166,9 @@ async def probe(args: argparse.Namespace) -> bool:
             print(
                 "Before:", {k: before.get(k) for k in (*expected, "SetTem", "Add0.5")}
             )
+            _, template, hex6a = load_template(args.capture, before)
+            expected = template_state(template)
+            print(f"Matched captured template state: {expected}")
             validate_live_state(before, expected, args.temperature)
             while not pushes.empty():
                 pushes.get_nowait()
