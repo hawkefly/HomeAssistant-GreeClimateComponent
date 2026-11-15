@@ -97,7 +97,9 @@ async def probe(
                 )
 
         try:
-            await transport.add_device(mac, device.mac_controller_mqtt, pushed)
+            # A retained status can arrive while the remaining topics subscribe.
+            transport.add_listener(mac, pushed)
+            await transport.add_device(mac, device.mac_controller_mqtt)
             result = await gree_get_status(
                 device.mac_controller_mqtt,
                 mac,

@@ -27,7 +27,7 @@ from aiogree.api import (
     gree_set_status,
 )
 from aiogree.binary_ac import BinaryAcError, build_bin_cmd
-from aiogree.cipher import EncryptionVersion, get_cipher
+from aiogree.cipher import CipherBase, EncryptionVersion, get_cipher
 from aiogree.cloud_api import GreeCloudApi, GreeRegion
 from aiogree.helpers import gree_decrypt_pack
 from aiogree.transport_mqtt import GreeMqttTransport
@@ -124,6 +124,35 @@ async def confirm_temperature(
                 return
 
 
+async def request_full_report(
+    transport: GreeMqttTransport,
+    cipher: CipherBase,
+    mac: str,
+    controller: str,
+    uid: int,
+) -> None:
+    """Use the captured report request; it may have no response topic reply."""
+    payload = {
+        "t": "pack",
+        "i": 0,
+        "uid": uid,
+        "cid": "app",
+        "tcid": controller,
+        "pack": {
+            "mac": mac,
+            "t": "freqCount",
+            "opt": ["SendFreq", "FreqTime"],
+            "p": [1, 300],
+        },
+    }
+    try:
+        await transport.request_json(
+            controller, payload, cipher, max_attempts=1, timeout=3
+        )
+    except TimeoutError:
+        print("Report request has no response reply; waiting for a push.", flush=True)
+
+
 async def probe(args: argparse.Namespace) -> bool:
     """Watch real pushes, send once if requested, then require a changed push."""
     identity, template, hex6a = load_template(args.capture)
@@ -167,7 +196,9 @@ async def probe(args: argparse.Namespace) -> bool:
 
         try:
             print("Stage: MQTT connect and subscribe", flush=True)
-            await transport.add_device(device.mac, device.mac_controller_mqtt, pushed)
+            # A retained status can arrive while the remaining topics subscribe.
+            transport.add_listener(device.mac, pushed)
+            await transport.add_device(device.mac, device.mac_controller_mqtt)
             print(
                 "Stage: read-only wake query (returned values are ignored)", flush=True
             )
@@ -179,6 +210,14 @@ async def probe(args: argparse.Namespace) -> bool:
                 cipher,
                 transport,
                 timeout=10,
+            )
+            print("Stage: request full status report (freqCount 1,300)", flush=True)
+            await request_full_report(
+                transport,
+                cipher,
+                device.mac,
+                device.mac_controller_mqtt,
+                credentials.user_id,
             )
             print("Stage: waiting for initial full status; no control sent", flush=True)
             try:

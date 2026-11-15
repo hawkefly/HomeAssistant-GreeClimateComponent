@@ -5,8 +5,11 @@ import base64
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from aiogree.binary_ac import BinaryAcError
+from aiogree.cipher import CipherV1
+from aiogree.helpers import gree_encrypt_pack
 import pytest
 
 SPEC = importlib.util.spec_from_file_location(
@@ -85,3 +88,106 @@ def test_template_selection_preserves_live_power(tmp_path: Path, power: int) -> 
     (tmp_path / "pcap-decrypted-private.json").write_text(json.dumps(rows))
     _, template, _ = PROBE.load_template(tmp_path, {**EXPECTED, "Pow": str(power)})
     assert (template[8] >> 7) & 1 == power
+
+
+class ProbeCloud:
+    """A cloud session without network access."""
+
+    async def __aenter__(self):
+        """Open the fake session."""
+        return self
+
+    async def __aexit__(self, *_args):
+        """Close the fake session."""
+        return
+
+    async def login(self):
+        """Return fake credentials."""
+        return SimpleNamespace(user_id=1, token="fake-session")
+
+
+class RetainedTransport:
+    """Emit the first status inside the subscription operation."""
+
+    def __init__(self) -> None:
+        """Start with no listener."""
+        self.listener = None
+
+    def add_listener(self, _mac, listener):
+        """Register before subscription starts."""
+        self.listener = listener
+
+    async def add_device(self, *_args):
+        """Push while the subscription is still in progress."""
+        assert self.listener is not None
+        self.push(BEFORE)
+
+    def push(self, state):
+        """Emit a full encrypted status."""
+        self.listener(
+            "status/test",
+            gree_encrypt_pack(
+                {
+                    "pack": {
+                        "t": "dat",
+                        "cols": list(state),
+                        "dat": list(state.values()),
+                    }
+                },
+                CipherV1("0123456789abcdef"),
+            ),
+        )
+
+    async def disconnect(self):
+        """Finish without network work."""
+        return
+
+
+async def test_initial_status_during_subscription_is_not_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first full status may arrive before add_device has returned."""
+    raw = bytearray(50)
+    raw[:4] = b"~~\x2f\x01"
+    raw[8] = 0x90
+    raw[12] = 0x10
+    raw[22] = 8
+    template = bytes(raw)
+    identity = {"mac": "test", "firmware": "V3.5.M"}
+    device = SimpleNamespace(
+        mac="test", mac_controller_mqtt="test", ver="V3.5.M", key="0123456789abcdef"
+    )
+
+    async def discover(_cloud):
+        return [device]
+
+    async def read_status(*_args, **_kwargs):
+        return None
+
+    async def report(*_args):
+        return None
+
+    async def set_status(*args):
+        transport = args[-1]
+        transport.push({**BEFORE, "SetTem": "26"})
+
+    monkeypatch.setattr(
+        PROBE, "load_template", lambda *_: (identity, template, bytes(21))
+    )
+    monkeypatch.setattr(PROBE, "GreeCloudApi", lambda *_: ProbeCloud())
+    monkeypatch.setattr(PROBE, "GreeMqttTransport", lambda *_: RetainedTransport())
+    monkeypatch.setattr(PROBE, "gree_discover_devices_cloud", discover)
+    monkeypatch.setattr(PROBE, "gree_get_status", read_status)
+    monkeypatch.setattr(PROBE, "request_full_report", report)
+    monkeypatch.setattr(PROBE, "gree_set_binary_status", set_status)
+    monkeypatch.setattr(PROBE, "input", lambda _: "fake-account", raising=False)
+    monkeypatch.setattr(PROBE, "getpass", lambda _: "fake-password")
+    args = SimpleNamespace(
+        capture=Path("unused"),
+        temperature=26,
+        send=True,
+        region="CN",
+        wait=1,
+        protocol="binary",
+    )
+    assert await PROBE.probe(args)
