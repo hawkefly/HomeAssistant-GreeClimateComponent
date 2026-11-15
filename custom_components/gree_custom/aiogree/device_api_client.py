@@ -452,7 +452,7 @@ class DeviceApiClient:
         if self.binding_info is None:
             return
 
-        if "status" not in topic:
+        if not {"status", "binStatus"}.intersection(topic.split("/")):
             return
 
         response = gree_decrypt_pack(

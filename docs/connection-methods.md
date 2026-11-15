@@ -35,6 +35,30 @@ Two things to know about the cloud:
 - Gree allows one session per account. Every login from Home Assistant ends the other sessions, so the Gree app logs you out. The integration stores the session and logs in again only when it has to.
 - Over the cloud the device always uses encryption version 1. The version setting in the local connection options does not apply.
 
+### A device that does not appear in local discovery
+
+Some WiFi modules can use the cloud but do not answer UDP 7000. Choose
+**Gree Cloud account** and the region of the account. For a mainland China
+account, choose **China Mainland**. The device must already be bound in the
+Gree app. Its IP address is not used for cloud discovery.
+
+This branch also follows the `binStatus` MQTT topic used by one such module.
+The topic path has unit tests, but that module has not yet been tested with a
+real account. The account API and MQTT login are the existing 5.0 code. This
+does not add a new local control protocol.
+
+To check a device before installing the integration, use Python 3.14:
+
+```bash
+pip install aiohttp cryptography pydantic aiomqtt asyncio-dgram
+python tools/probe_cloud_mqtt.py --mac <device-mac> --region CN
+```
+
+The tool asks for the account and password in the terminal. It does not save
+them. It queries four status fields and then watches pushes for 15 seconds.
+It sends no commands to change the device. As with any Gree account login,
+this can log the phone app out.
+
 ## Mixed setup
 
 Choose both methods. The integration lists the devices of the account and also runs local discovery. The list shows, for every cloud device, whether it was also found on the network.

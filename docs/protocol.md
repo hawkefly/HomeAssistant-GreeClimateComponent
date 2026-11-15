@@ -138,5 +138,9 @@ MACs are written in lower case with no separators. Talking to a device needs two
 ## Cloud
 
 - Login and device list go over HTTPS to a regional `*grih.gree.com` host. Control goes over MQTT to the matching `mqtt-*.gree.com` broker. Both are picked from `GreeRegion`.
+- This experimental branch uses `mqtt.gree.com` on TLS port 1984 for mainland China. The previous `mqtt-cn.gree.com` entry did not resolve during this investigation. The replacement resolved and completed a TLS handshake with a valid Gree certificate. This makes it a candidate endpoint; account access and device control still need a real account test. The header of [greeclimate 1.0.1](https://github.com/davo22/greeclimate/blob/1.0.1/greeclimate/mqtt_client.py) also names this host, but that source does not have a mainland region mapping.
 - The MQTT transport sends each request once. There are no retries at the transport level.
-- Pushed status arrives on a `status` topic and goes through the same `gree_process_status_pack()` as polled status.
+- Pushed status can arrive on `status/<controller>` or `binStatus/<controller>`, with optional topic suffixes. The latter was seen in a capture from a mainland China unit that did not answer local discovery. Topic names are case sensitive. Both go through the existing pack decryption and `gree_process_status_pack()` when the decrypted pack contains `cols` and `dat`.
+- A `binStatus` push does not complete a pending request. Only `response/<controller>` for the pending controller does that. A reply from another controller is ignored.
+- The capture alone does not reveal the device key or the decrypted `binStatus` layout. The new topic path is tested with synthetic encrypted status packs. It still needs a test with that real unit and its cloud account.
+- The bytes before the JSON on a device's cloud connection can be MQTT framing: a PUBLISH header, variable-length remaining size, topic and optional packet identifier. Do not send those bytes to UDP 7000. One MQTT message can span several TCP packets.

@@ -19,7 +19,7 @@ _LOGGER = logging.getLogger(__name__)
 
 MQTT_SERVERS = {
     GreeRegion.AU: "mqtt-au.gree.com",
-    GreeRegion.CN: "mqtt-cn.gree.com",
+    GreeRegion.CN: "mqtt.gree.com",
     GreeRegion.AS: "mqtt-as.gree.com",
     GreeRegion.EU: "mqtt-eu.gree.com",
     GreeRegion.IN: "mqtt-in.gree.com",
@@ -66,6 +66,7 @@ class GreeMqttTransport(GreeBaseTransport):
 
         self._request_lock = asyncio.Lock()
         self._pending: asyncio.Future[str] | None = None
+        self._pending_controller: str | None = None
 
     @override
     def __str__(self) -> str:
@@ -143,6 +144,7 @@ class GreeMqttTransport(GreeBaseTransport):
             topics = [
                 f"response/{mac_controller}/#",
                 f"status/{mac_controller}/#",
+                f"binStatus/{mac_controller}/#",
                 f"connect/{mac_controller}",
             ]
 
@@ -159,6 +161,7 @@ class GreeMqttTransport(GreeBaseTransport):
             topics = [
                 f"response/{mac_controller}/#",
                 f"status/{mac_controller}/#",
+                f"binStatus/{mac_controller}/#",
                 f"connect/{mac_controller}",
             ]
 
@@ -191,6 +194,7 @@ class GreeMqttTransport(GreeBaseTransport):
         async with self._request_lock:
             future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
             self._pending = future
+            self._pending_controller = mac_controller
 
             try:
                 # Responses match 1:1 requests
@@ -207,6 +211,7 @@ class GreeMqttTransport(GreeBaseTransport):
 
             finally:
                 self._pending = None
+                self._pending_controller = None
 
     def _receive_task_done(self, task: asyncio.Task[None]) -> None:
         """Handle receive task completion."""
@@ -232,6 +237,10 @@ class GreeMqttTransport(GreeBaseTransport):
         async for message in self._client.messages:
             topic = str(message.topic)
             payload = message.payload.decode()
+            parts = topic.split("/")
+            if len(parts) < 2:
+                continue
+            kind, controller = parts[:2]
 
             _LOGGER.debug("Received MQTT Message with topic: %s", topic)
 
@@ -239,7 +248,8 @@ class GreeMqttTransport(GreeBaseTransport):
             # response/ completes pending request
             #
             if (
-                topic.startswith("response/")
+                kind == "response"
+                and controller == self._pending_controller
                 and self._pending
                 and not self._pending.done()
             ):
@@ -247,10 +257,13 @@ class GreeMqttTransport(GreeBaseTransport):
                 continue
 
             #
-            # status/ and connect/
+            # status/, binStatus/ and connect/
             #
+            if kind not in {"status", "binStatus", "connect"}:
+                continue
+
             for target_mac, listeners in self._listeners.items():
-                if target_mac not in topic:
+                if target_mac not in parts[1:]:
                     continue
 
                 for listener in listeners:

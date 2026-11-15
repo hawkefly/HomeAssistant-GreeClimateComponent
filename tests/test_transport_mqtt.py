@@ -83,20 +83,35 @@ async def test_connecting_twice_reuses_the_connection(
     assert len(FakeMqttClient.instances) == 1
 
 
+async def test_china_uses_the_mainland_broker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mainland China uses mqtt.gree.com, without a region suffix."""
+    monkeypatch.setattr(transport_mqtt.aiomqtt, "Client", FakeMqttClient)
+    mqtt = GreeMqttTransport("4242", "cloud-token", GreeRegion.CN)
+    try:
+        await mqtt.connect()
+        assert broker().options["hostname"] == "mqtt.gree.com"
+        assert broker().options["port"] == 1984
+    finally:
+        await mqtt.disconnect()
+
+
 async def add(transport: GreeMqttTransport, mac: str = MAC) -> None:
     """Add one device of the controller MAC to the transport."""
     await transport.add_device(mac_addr=mac, mac_addr_controller=MAC)
 
 
-async def test_adding_a_device_follows_the_three_topics(
+async def test_adding_a_device_follows_the_four_topics(
     transport: GreeMqttTransport,
 ) -> None:
-    """Responses, pushed status and the connect message each have a topic."""
+    """Both status topic forms are needed, as well as replies and connect."""
     await add(transport)
 
     assert broker().subscriptions == [
         f"response/{MAC}/#",
         f"status/{MAC}/#",
+        f"binStatus/{MAC}/#",
         f"connect/{MAC}",
     ]
 
@@ -108,7 +123,7 @@ async def test_a_second_device_does_not_subscribe_twice(
     await add(transport, SUB_MACS[0])
     await add(transport, SUB_MACS[1])
 
-    assert len(broker().subscriptions) == 3
+    assert len(broker().subscriptions) == 4
     assert transport.connections == {MAC: list(SUB_MACS)}
 
 
@@ -127,6 +142,7 @@ async def test_the_last_device_closes_the_connection(
     assert broker().unsubscriptions == [
         f"response/{MAC}/#",
         f"status/{MAC}/#",
+        f"binStatus/{MAC}/#",
         f"connect/{MAC}",
     ]
     assert broker().exited
@@ -174,8 +190,10 @@ async def test_removing_a_device_before_connecting_is_refused(
         await transport.remove_device(mac_addr=MAC, mac_addr_controller=MAC)
 
 
+@pytest.mark.parametrize("topic_kind", ["status", "binStatus"])
 async def test_a_pushed_status_reaches_the_listeners(
     transport: GreeMqttTransport,
+    topic_kind: str,
 ) -> None:
     """The device sends state without being asked. That is the point of MQTT."""
     seen: list[tuple[str, dict]] = []
@@ -185,10 +203,40 @@ async def test_a_pushed_status_reaches_the_listeners(
         listener=lambda topic, payload: seen.append((topic, payload)),
     )
 
-    broker().deliver(f"status/{MAC}/1", json.dumps({"t": "pack", "pack": "abc"}))
+    topic = f"{topic_kind}/{MAC}"
+    broker().deliver(topic, json.dumps({"t": "pack", "pack": "abc"}))
     await settle()
 
-    assert seen == [(f"status/{MAC}/1", {"t": "pack", "pack": "abc"})]
+    assert seen == [(topic, {"t": "pack", "pack": "abc"})]
+
+
+async def test_a_push_cannot_complete_a_pending_request(
+    transport: GreeMqttTransport,
+) -> None:
+    """A binStatus push and a reply from another controller are not replies."""
+    await add(transport)
+    task = asyncio.create_task(transport.request(MAC, '{"t":"status"}'))
+    await settle()
+
+    broker().deliver(f"binStatus/{MAC}", '{"t":"pack"}')
+    broker().deliver("response/c03937b12280", '{"t":"other"}')
+    await settle()
+    assert not task.done()
+
+    broker().deliver(f"response/{MAC}", '{"t":"dat"}')
+    assert await task == '{"t":"dat"}'
+
+
+async def test_a_topic_with_a_mac_as_a_substring_is_ignored(
+    transport: GreeMqttTransport,
+) -> None:
+    """A topic must name the full controller MAC."""
+    await add(transport)
+    seen: list[str] = []
+    transport.add_listener(MAC, lambda topic, _: seen.append(topic))
+    broker().deliver(f"binStatus/{MAC}00", '{"t":"pack"}')
+    await settle()
+    assert not seen
 
 
 async def test_a_status_for_another_device_is_ignored(

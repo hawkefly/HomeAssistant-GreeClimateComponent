@@ -398,9 +398,14 @@ async def test_unbind_on_an_unbound_client_does_nothing() -> None:
     assert not client.bound
 
 
-async def test_a_pushed_status_reaches_the_listeners() -> None:
+@pytest.mark.parametrize("topic_kind", ["status", "binStatus"])
+@pytest.mark.parametrize("version", [EncryptionVersion.V1, EncryptionVersion.V2])
+async def test_a_pushed_status_reaches_the_listeners(
+    topic_kind: str,
+    version: EncryptionVersion,
+) -> None:
     """Over MQTT the device sends status without being asked."""
-    fake = FakeGreeDevice()
+    fake = FakeGreeDevice(encryption_version=version)
     transport = FakePushTransport(fake)
     client = DeviceApiClient(mac=fake.mac, userid=0)
     await client.set_transport(transport)
@@ -413,7 +418,7 @@ async def test_a_pushed_status_reaches_the_listeners() -> None:
         {"t": "pack", "pack": {"t": "dat", "cols": ["Pow"], "dat": [1]}},
         fake.session_cipher(),
     )
-    transport.push(fake.mac, f"gree/{fake.mac}/status", payload)
+    transport.push(fake.mac, f"{topic_kind}/{fake.mac}", payload)
 
     assert seen == [{"Pow": "1"}]
 
