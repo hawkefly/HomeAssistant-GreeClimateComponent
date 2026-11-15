@@ -29,6 +29,11 @@ local discovery. Choose its cloud connection. Do not enter a new local packet
 prefix or a different UDP port. Read [installation.md](installation.md) for
 migration from older versions.
 
+The tested build did not answer UDP 7000 from either a wired computer or a
+phone on the same Wi-Fi. Its firmware keeps a station-mode UDP send socket,
+but no receive consumer was found for it. See [UDP findings](wb05-tg-udp-findings.md)
+for the evidence and its limits. This profile requires cloud connectivity.
+
 ## Available controls
 
 - Cooling and off.
