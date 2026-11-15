@@ -21,6 +21,7 @@ sys.path.insert(
 
 from aiogree.api import (
     gree_discover_devices_cloud,
+    gree_get_status,
     gree_process_status_pack,
     gree_set_binary_status,
     gree_set_status,
@@ -136,7 +137,9 @@ async def probe(args: argparse.Namespace) -> bool:
     username = (await asyncio.to_thread(input, "Gree account: ")).strip()
     password = await asyncio.to_thread(getpass, "Gree password: ")
     async with GreeCloudApi(GreeRegion[args.region], username, password) as cloud:
+        print("Stage: cloud login", flush=True)
         credentials = await cloud.login()
+        print("Stage: account device discovery", flush=True)
         devices = await gree_discover_devices_cloud(cloud)
         device = next((dev for dev in devices if dev.mac == identity["mac"]), None)
         if device is None or device.ver != identity["firmware"]:
@@ -150,7 +153,9 @@ async def probe(args: argparse.Namespace) -> bool:
         pushes: asyncio.Queue[dict[str, str]] = asyncio.Queue()
 
         def pushed(topic: str, envelope: dict) -> None:
-            if topic.split("/", maxsplit=1)[0] != "status":
+            kind = topic.split("/", maxsplit=1)[0]
+            print(f"Push received: {kind}", flush=True)
+            if kind != "status":
                 return
             try:
                 pack = gree_decrypt_pack(envelope.copy(), cipher).get("pack", {})
@@ -161,8 +166,27 @@ async def probe(args: argparse.Namespace) -> bool:
                 print(f"Push decode failed: {type(err).__name__}")
 
         try:
+            print("Stage: MQTT connect and subscribe", flush=True)
             await transport.add_device(device.mac, device.mac_controller_mqtt, pushed)
-            before = await asyncio.wait_for(pushes.get(), timeout=args.wait)
+            print(
+                "Stage: read-only wake query (returned values are ignored)", flush=True
+            )
+            await gree_get_status(
+                device.mac_controller_mqtt,
+                device.mac,
+                credentials.user_id,
+                ["Pow", "Mod", "SetTem", "TemSen"],
+                cipher,
+                transport,
+                timeout=10,
+            )
+            print("Stage: waiting for initial full status; no control sent", flush=True)
+            try:
+                before = await asyncio.wait_for(pushes.get(), timeout=args.wait)
+            except TimeoutError as err:
+                raise BinaryAcError(
+                    "No initial full status push; no control sent"
+                ) from err
             print(
                 "Before:", {k: before.get(k) for k in (*expected, "SetTem", "Add0.5")}
             )
@@ -172,6 +196,7 @@ async def probe(args: argparse.Namespace) -> bool:
             validate_live_state(before, expected, args.temperature)
             while not pushes.empty():
                 pushes.get_nowait()
+            print(f"Stage: sending one {args.protocol} temperature command", flush=True)
             if args.protocol == "json":
                 await gree_set_status(
                     device.mac_controller_mqtt,
