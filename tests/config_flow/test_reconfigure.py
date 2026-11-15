@@ -46,6 +46,7 @@ from tests.config_flow.conftest import (
     MAC_C,
     GreeEnv,
     add_entry,
+    assert_mqtt_status_uses_device_key,
     binds,
     choose,
     form_input,
@@ -303,10 +304,10 @@ async def test_edit_without_a_new_connection_reuses_the_running_device(
 async def test_edit_with_a_new_bind_setting_binds_with_the_stored_token(
     hass: HomeAssistant, gree: GreeEnv, cloud_entry: ConfigEntry
 ) -> None:
-    """Prefer cloud for A: a bind over MQTT with the stored token, no login.
+    """Prefer cloud for A using the account device key and stored token.
 
-    The flow opens its own MQTT client for the bind and closes it when the
-    flow ends.
+    The flow opens its own MQTT client for status requests and closes it when
+    the flow ends. No new login or generic bind is needed.
     """
     clients_before = len(gree.broker.clients)
 
@@ -322,8 +323,8 @@ async def test_edit_with_a_new_bind_setting_binds_with_the_stored_token(
     assert flow_client.options["password"] == TOKEN
     assert flow_client.entered
     assert not flow_client.exited
-    assert any(topic == f"request/{MAC_A}" for topic, _ in flow_client.published)
-    assert binds(gree.devices[MAC_A]) == 1
+    assert_mqtt_status_uses_device_key(flow_client, MAC_A)
+    assert binds(gree.devices[MAC_A]) == 0
     assert gree.logins == 0
 
     result = await submit(hass, result)
@@ -349,7 +350,8 @@ async def test_edit_with_prefer_cloud_refreshes_a_revoked_token(
     Regression for the maintainer's report A3: "Edit a device, tick Prefer
     cloud connection" failed with cannot_connect_mqtt, `[code:134] Bad user
     name or password`. The broker refuses the stored token. The flow logs in once with the
-    stored account, binds A with the new token, and finish writes that token.
+    stored account, queries A with its device key and the new token, and finish
+    writes that token.
     """
     clients_before = len(gree.broker.clients)
     gree.revoke_token(NEW_TOKEN)
@@ -362,7 +364,7 @@ async def test_edit_with_prefer_cloud_refreshes_a_revoked_token(
     )
     assert result["step_id"] == "device_options"
     assert gree.logins == 1
-    assert binds(gree.devices[MAC_A]) == 1
+    assert binds(gree.devices[MAC_A]) == 0
 
     # The client with the stored token was refused, the second one connected
     refused, flow_client = gree.broker.clients[clients_before:]
@@ -370,6 +372,8 @@ async def test_edit_with_prefer_cloud_refreshes_a_revoked_token(
     assert not refused.entered
     assert flow_client.options["password"] == NEW_TOKEN
     assert flow_client.entered
+    assert not refused.published
+    assert_mqtt_status_uses_device_key(flow_client, MAC_A)
 
     result = await submit(hass, result)
     result = await choose(hass, result, "finish")

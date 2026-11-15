@@ -14,6 +14,8 @@ import json
 import logging
 from pathlib import Path
 import sys
+import traceback
+from typing import override
 
 sys.path.insert(
     0, str(Path(__file__).resolve().parents[1] / "custom_components" / "gree_custom")
@@ -29,6 +31,7 @@ from aiogree.api import (
 from aiogree.binary_ac import BinaryAcError, build_bin_cmd
 from aiogree.cipher import CipherBase, EncryptionVersion, get_cipher
 from aiogree.cloud_api import GreeCloudApi, GreeRegion
+from aiogree.device import GreeDevice
 from aiogree.helpers import gree_decrypt_pack
 from aiogree.transport_mqtt import GreeMqttTransport
 
@@ -153,6 +156,87 @@ async def request_full_report(
         print("Report request has no response reply; waiting for a push.", flush=True)
 
 
+class TracedGreeDevice(GreeDevice):  # type: ignore[misc]  # CLI imports from the component path.
+    """Show setup stages without printing credentials or response contents."""
+
+    @override
+    async def fetch_device_info(self) -> None:
+        """Label the information query separately from binding."""
+        print("Stage: HA client device information query", flush=True)
+        await super().fetch_device_info()
+        print(
+            f"Stage: HA information received; exact profile={self.firmware_version}",
+            flush=True,
+        )
+
+    @override
+    async def fetch_device_status(self, first_fetch: bool = False) -> None:
+        """Label the fresh status wait and profile activation."""
+        print(
+            f"Stage: HA client full status poll; binary={self.is_binary_ac}", flush=True
+        )
+        await super().fetch_device_status(first_fetch)
+
+
+async def probe_ha_client(
+    mac: str,
+    key: str | None,
+    userid: int,
+    transport: GreeMqttTransport,
+    temperature: int,
+) -> bool:
+    """Use the same device setup, poll and command code as Home Assistant."""
+    device = TracedGreeDevice(
+        "WB05 verification", mac, preferred_encryption_key=key, user_id=userid
+    )
+    try:
+        print(
+            "Stage: HA client bind, exact profile detection and initial full poll",
+            flush=True,
+        )
+        await device.bind_with_transport(
+            mqtt_transport=transport, mqtt_controller_mac=mac
+        )
+        if not device.is_binary_ac:
+            raise BinaryAcError("HA client did not enable the exact WB05-TG profile")
+        print(
+            f"HA before: power={device.power_mode}, target={device.target_temperature}, room={device.indoors_temperature_c}"
+        )
+        if device.target_temperature == temperature:
+            raise BinaryAcError(
+                "Temperature already matches; choose a different temperature"
+            )
+        was_on = device.power_mode
+        device.set_target_temperature(temperature)
+        print(
+            "Stage: HA client guarded command and fresh confirmation poll", flush=True
+        )
+        await device.push_device_status()
+        print(
+            f"HA after: power={device.power_mode}, target={device.target_temperature}, room={device.indoors_temperature_c}"
+        )
+        if device.target_temperature != temperature or device.power_mode != was_on:
+            raise BinaryAcError("HA client received a different resulting state")
+        print(
+            "CONFIRMED: the HA device client reports the changed temperature and preserved power."
+        )
+        return True
+    finally:
+        await device.unbind_device()
+        await transport.disconnect()
+
+
+async def initial_status(
+    pushes: asyncio.Queue[dict[str, str]],
+    wait_seconds: int,
+) -> dict[str, str]:
+    """Wait for full state without sending a control on timeout."""
+    try:
+        return await asyncio.wait_for(pushes.get(), timeout=wait_seconds)
+    except TimeoutError as err:
+        raise BinaryAcError("No initial full status push; no control sent") from err
+
+
 async def probe(args: argparse.Namespace) -> bool:
     """Watch real pushes, send once if requested, then require a changed push."""
     identity, template, hex6a = load_template(args.capture)
@@ -179,6 +263,10 @@ async def probe(args: argparse.Namespace) -> bool:
         transport = GreeMqttTransport(
             str(credentials.user_id), credentials.token, GreeRegion[args.region]
         )
+        if args.ha_client:
+            return await probe_ha_client(
+                device.mac, device.key, credentials.user_id, transport, args.temperature
+            )
         pushes: asyncio.Queue[dict[str, str]] = asyncio.Queue()
 
         def pushed(topic: str, envelope: dict) -> None:
@@ -220,12 +308,7 @@ async def probe(args: argparse.Namespace) -> bool:
                 credentials.user_id,
             )
             print("Stage: waiting for initial full status; no control sent", flush=True)
-            try:
-                before = await asyncio.wait_for(pushes.get(), timeout=args.wait)
-            except TimeoutError as err:
-                raise BinaryAcError(
-                    "No initial full status push; no control sent"
-                ) from err
+            before = await initial_status(pushes, args.wait)
             print(
                 "Before:", {k: before.get(k) for k in (*expected, "SetTem", "Add0.5")}
             )
@@ -272,6 +355,11 @@ def main() -> None:
     parser.add_argument("--protocol", choices=("binary", "json"), default="binary")
     parser.add_argument("--wait", type=int, default=45)
     parser.add_argument("--send", action="store_true")
+    parser.add_argument(
+        "--ha-client",
+        action="store_true",
+        help="Test the full Home Assistant device path",
+    )
     args = parser.parse_args()
     if not 5 <= args.wait <= 120:
         parser.error("--wait must be between 5 and 120 seconds")
@@ -283,6 +371,17 @@ def main() -> None:
             print(f"Stopped: {err}")
         else:
             print(f"Test failed: {type(err).__name__}")
+            if args.ha_client:
+                current: BaseException | None = err
+                while current is not None:
+                    frames = traceback.extract_tb(current.__traceback__)
+                    print(
+                        f"Error type: {type(current).__name__}; path: "
+                        + " -> ".join(
+                            f"{frame.name}:{frame.lineno}" for frame in frames[-6:]
+                        )
+                    )
+                    current = current.__cause__
         sys.exit(1)
     if not success:
         sys.exit(1)

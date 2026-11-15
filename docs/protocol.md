@@ -138,11 +138,11 @@ MACs are written in lower case with no separators. Talking to a device needs two
 ## Cloud
 
 - Login and device list go over HTTPS to a regional `*grih.gree.com` host. Control goes over MQTT to the matching `mqtt-*.gree.com` broker. Both are picked from `GreeRegion`.
-- This experimental branch uses `mqtt.gree.com` on TLS port 1984 for mainland China. The previous `mqtt-cn.gree.com` entry did not resolve during this investigation. The replacement resolved and completed a TLS handshake with a valid Gree certificate. A real China account test has now confirmed login, device discovery, device-key retrieval and decoded status pushes. Newly generated control commands still need a device test. The header of [greeclimate 1.0.1](https://github.com/davo22/greeclimate/blob/1.0.1/greeclimate/mqtt_client.py) also names this host, but that source does not have a mainland region mapping.
+- This experimental branch uses `mqtt.gree.com` on TLS port 1984 for mainland China. The previous `mqtt-cn.gree.com` entry did not resolve during this investigation. The replacement resolved and completed a TLS handshake with a valid Gree certificate. A real China account test confirmed login, device discovery, device-key retrieval and decoded status pushes. A generated binary temperature command was confirmed by a later full push, from 25 to 26 Celsius with power kept off. The header of [greeclimate 1.0.1](https://github.com/davo22/greeclimate/blob/1.0.1/greeclimate/mqtt_client.py) also names this host, but that source does not have a mainland region mapping.
 - The MQTT transport sends each request once. There are no retries at the transport level.
 - Pushed status can arrive on `status/<controller>` or `binStatus/<controller>`, with optional topic suffixes. The latter was seen in a capture from a mainland China unit that did not answer local discovery. Topic names are case sensitive. Both go through the existing pack decryption and `gree_process_status_pack()` when the decrypted pack contains `cols` and `dat`.
 - A `binStatus` push does not complete a pending request. Only `response/<controller>` for the pending controller does that. A reply from another controller is ignored.
-- The account test supplied the device key locally. It decrypted all 41 device messages in the capture, including 12 real binary reports. The broker also sends full `cols/dat` status pushes to the app. A plain property query on this V3.5.M unit returned zeros for all four requested fields while full pushes reported valid state. Do not use those query zeros as device state. The normal client does not yet handle this difference.
+- The account test supplied the device key locally. It decrypted all 41 device messages in the capture, including 12 real binary reports. The broker also sends full `cols/dat` status pushes to the app. A plain property query on this V3.5.M unit returned zeros for all four requested fields while full pushes reported valid state. Do not use those query zeros as device state. The matched WB05-TG profile uses fresh full pushes instead.
 - The bytes before the JSON on a device's cloud connection can be MQTT framing: a PUBLISH header, variable-length remaining size, topic and optional packet identifier. Do not send those bytes to UDP 7000. One MQTT message can span several TCP packets.
 
 ### Experimental binary AC commands
@@ -154,7 +154,7 @@ These are network frames with zero checksum fields, not complete UART packets.
 
 `gree_set_binary_status()` is a separate experimental API. It requires MQTT
 and a V1 device cipher. The caller must supply a command template and `hex6A`
-frame matched to the device model. It is not used by the normal device client.
+frame matched to the device model. The exact WB05-TG profile uses it through the device client after its hardware and firmware are checked. Other models do not use it.
 The codec supports power, mode, whole Celsius target temperature, automatic
 fan speed and both swing fields. Other fan speeds, fractional temperatures
 and unknown properties are rejected. The extra temperature bit is kept as
@@ -195,3 +195,45 @@ captured `[1, 300]` request schedules a full report. The live test sends that
 request before waiting for initial state. It may not receive a separate
 response reply. The listener is registered before subscribing so that an
 early retained report is not lost.
+
+
+### Matched WB05-TG device path
+
+`wb05_tg.matches_wb05_tg()` requires mid `10015`, the full hardware id
+`362001065909+U-WB05_TGV1.30.bin` and protocol version `V3.5.M`. Only MQTT
+can activate it. `BinaryAcSession` keeps complete pushes for command guards,
+but projects only basic fields into `DeviceState`. Its `TemRec` projection
+comes from `Add0.5`, because this target's original `TemRec` stayed zero even
+when its full push reported `Add0.5=1`.
+
+Each binary poll registers a waiter before sending the captured `freqCount`
+request. It requires a new complete push; a receipt or an old snapshot cannot
+satisfy it. A timeout marks the client unavailable. A transport change clears
+the profile session. A rebind on the same transport retains the profile but
+clears its snapshot.
+
+`GreeDevice` refreshes state before preparing a command and after acceptance.
+The profile copies known live power, mode, temperature and swing into the
+anonymous command template. It checks the other captured feature defaults
+before using that template, and rejects unsupported or fractional writes.
+The normal JSON `set_props` entry point is disabled for this session so it
+cannot bypass that check. An early push received before profile detection
+cannot enable extra capabilities. The client removes them at activation.
+Full cloud reports include array-valued fault columns such as
+`ShutdownFault` and `SubhealthFault`. The parser keeps their existing string
+form in the guard snapshot. These extra columns do not become HA controls.
+An array in a required numeric control still fails full-report validation.
+
+For MQTT with a supplied account device key, the client uses V1 directly,
+without generic binding or column-limit probing. A local connection or a
+cloud connection without a key keeps the existing binding flow. This follows
+the account-key path verified by the cloud probe. No encryption key is logged
+in clear text.
+
+Some MQTT firmware returns a different number of values and columns for a
+batch of device information fields. The parser still rejects that response.
+The device retries information fields one at a time after this protocol
+error, so an unsupported field cannot shift the other values. Local queries
+and connection failures keep their existing error behavior.
+
+See [experimental-wb05-tg.md](experimental-wb05-tg.md) for user limits and setup.

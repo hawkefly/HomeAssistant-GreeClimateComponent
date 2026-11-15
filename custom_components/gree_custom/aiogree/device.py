@@ -31,6 +31,7 @@ from .api import (
     VerticalSwingMode,
     extract_fw_version,
 )
+from .binary_session import BINARY_STATUS_PROPS
 from .cloud_api import FirmwareInfoResponse, GreeRegion, gree_get_latest_firmware_info
 from .const import (
     DEFAULT_DEVICE_USERID,
@@ -68,6 +69,7 @@ from .helpers import (
 from .transport import GreeBaseTransport
 from .transport_mqtt import GreeMqttTransport
 from .transport_udp import GreeUdpTransport
+from .wb05_tg import matches_wb05_tg, prepare_wb05_tg_command
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -130,6 +132,7 @@ class GreeDevice:
         self._firmware_protocol_version: str = ""
 
         self._device_type: DeviceType = DeviceType.AC_UNIT
+        self._is_binary_ac = False
 
         # The column of each group that the device answers, see
         # _remove_unsupported_props. None until the first bind, or when the
@@ -160,6 +163,7 @@ class GreeDevice:
     ) -> None:
         """Bind the device to a new transport. It will try local transport first and then MQTT."""
         await self._api.unbind()
+        self._is_binary_ac = False
 
         if not local_transport and not mqtt_transport:
             raise GreeBindingError(
@@ -220,6 +224,7 @@ class GreeDevice:
 
                 # Fetch initial information after sucessful bind
                 await self.fetch_device_info()
+                self._detect_binary_ac()
                 self._detect_device_type()
                 await self.fetch_device_status(first_fetch=True)
                 self._remove_unsupported_props()
@@ -230,6 +235,19 @@ class GreeDevice:
     def _device_pushed_status(self, status: dict[str, str]) -> None:
         _LOGGER.debug("[%s] Got data pushed from the device", self.unique_id)
         self._state.process_new_state(status)
+
+    def _detect_binary_ac(self) -> None:
+        """Enable the verified profile only after fetching hardware and firmware."""
+        self._is_binary_ac = isinstance(self.transport, GreeMqttTransport) and (
+            matches_wb05_tg(
+                {prop.value: value for prop, value in self._state.info.items()}
+            )
+        )
+        if self._is_binary_ac:
+            self._api.configure_binary_ac_status()
+            for prop in list(self._state.raw):
+                if prop.value not in BINARY_STATUS_PROPS:
+                    self._state.remove(prop)
 
     def _detect_device_type(self) -> None:
         """Find out what kind of device this is.
@@ -282,7 +300,18 @@ class GreeDevice:
 
         try:
             props = [prop.value for prop in InfoProp]
-            result = await self._api.query_props(props, len(props))
+            try:
+                result = await self._api.query_props(props, len(props))
+            except GreeProtocolError:
+                if not isinstance(self.transport, GreeMqttTransport):
+                    raise
+                _LOGGER.debug(
+                    "[%s] Retrying MQTT device info one column at a time",
+                    self.unique_id,
+                )
+                result = await self._api.query_props(
+                    props, 1, error_as_missing=True, max_attempts=1
+                )
 
         except GreeConnectionError, GreeProtocolError:
             _LOGGER.exception(
@@ -382,12 +411,35 @@ class GreeDevice:
 
         # Theoretically, the device saves the beeper value when the property is sent with others,
         # however remote commands overwrite the value to enable the beeper, so here we force our state
-        self._state.set(GreeProp.BEEPER, 0 if self._beeper else 1)
-        self._state.set(GreeProp.BEEPER_NEW, 1 if self._beeper else 0)
+        if not self.is_binary_ac:
+            self._state.set(GreeProp.BEEPER, 0 if self._beeper else 1)
+            self._state.set(GreeProp.BEEPER_NEW, 1 if self._beeper else 0)
 
         try:
             sent = dict(self._state.pending)
-            await self._api.set_props({k.value: v for k, v in sent.items()})
+            values = {k.value: v for k, v in sent.items()}
+            if self.is_binary_ac:
+                await self._api.query_props(
+                    [
+                        "Pow",
+                        "Mod",
+                        "SetTem",
+                        "WdSpd",
+                        "SwUpDn",
+                        "SwingLfRig",
+                        "TemSen",
+                        "TemUn",
+                    ],
+                    8,
+                )
+                snapshot = {
+                    **{prop.value: value for prop, value in self._state.info.items()},
+                    **self._api.binary_ac_status,
+                }
+                props, template, hex6a = prepare_wb05_tg_command(values, snapshot)
+                await self._api.set_binary_props(props, template, hex6a)
+            else:
+                await self._api.set_props(values)
 
             _LOGGER.debug("[%s:%s] Device status set", self.unique_id, self.transport)
             # A VRF gateway answers the read below from its cache, with the old
@@ -395,7 +447,7 @@ class GreeDevice:
             # sent until the gateway reports it. Other units are not held: a
             # value the unit corrects, for example an unsupported swing mode,
             # then shows at once.
-            if self.is_sub_unit:
+            if self.is_sub_unit and not self.is_binary_ac:
                 self._state.hold(sent)
             self._state.clear_pending()
 
@@ -570,6 +622,9 @@ class GreeDevice:
 
     def supports_property(self, property: GreeProp) -> bool:
         """Return True if the device endpoint supports the property."""
+        if self.is_binary_ac and property in (GreeProp.BEEPER, GreeProp.BEEPER_NEW):
+            return False
+
         # A zone controller has turbo as a fan speed, not as its own column.
         if (
             property is GreeProp.FEAT_TURBO_MODE
@@ -608,6 +663,11 @@ class GreeDevice:
             return False, latest_fw
 
         return Version(self._firmware_version) < Version(latest_fw.version), latest_fw
+
+    @property
+    def is_binary_ac(self) -> bool:
+        """Return whether the exact WB05-TG profile was confirmed over MQTT."""
+        return self._is_binary_ac
 
     @property
     def transport(self) -> GreeBaseTransport | None:
@@ -965,6 +1025,8 @@ class GreeDevice:
 
     def set_target_temperature_unit(self, units: TemperatureUnits) -> None:
         """Set the units of the target temperature."""
+        if self.is_binary_ac and units != TemperatureUnits.C:
+            raise GreeProtocolError("WB05-TG commands only support Celsius")
         if self._temp_unit_prop is None:
             _LOGGER.warning("[%s] The device has no temperature unit", self.unique_id)
             return
@@ -1010,6 +1072,14 @@ class GreeDevice:
         The bit is sent along when the device answers it. A zone needs that,
         because it keeps the old bit when only StTem is sent.
         """
+        if self.is_binary_ac and (
+            self.target_temperature_unit != TemperatureUnits.C
+            or not 16 <= value <= 31
+            or not float(value).is_integer()
+        ):
+            raise GreeProtocolError(
+                "WB05-TG commands require an integer temperature from 16 to 31 Celsius"
+            )
         if self._target_temp_prop is None:
             _LOGGER.warning("[%s] The device has no target temperature", self.unique_id)
             return

@@ -32,3 +32,5 @@ All docs follow the writing rules in `AGENTS.md`: plain English, short sentences
 `AGENTS.md` in the repo root is the short entry point for coding agents. It links here for the details. `CONTRIBUTING.md` has the step by step setup of the development environment.
 
 A change in behavior that a user can see needs a change in the user documentation too. The entity docs and the option tables are checked against the code, so keep them exact.
+
+[Experimental WB05-TG support](experimental-wb05-tg.md) describes the exact China cloud profile and its limits on this branch.

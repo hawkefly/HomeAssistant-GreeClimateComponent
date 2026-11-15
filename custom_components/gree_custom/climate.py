@@ -233,6 +233,16 @@ class GreeClimate(GreeEntity, ClimateEntity, RestoreEntity):  # pyright: ignore[
         # Last external sensor value and its unit
         self._external_temperature: tuple[float, str] | None = None
 
+        if self.device.is_binary_ac:
+            hvac_modes = [HVACMode.COOL, HVACMode.OFF]
+            fan_modes = [FanSpeed.auto.name]
+            swing_modes = [
+                VerticalSwingMode.default.name,
+                VerticalSwingMode.full_swing.name,
+            ]
+            swing_horizontal_modes = []
+            temperature_step = 1
+
         self._attr_target_temperature_step = temperature_step
 
         self._attr_hvac_modes = hvac_modes
@@ -610,7 +620,9 @@ class GreeClimate(GreeEntity, ClimateEntity, RestoreEntity):  # pyright: ignore[
 
         if self._attr_supported_features & ClimateEntityFeature.TARGET_TEMPERATURE:
             self._attr_max_temp = (
-                MAX_TEMP_C
+                31
+                if self.device.is_binary_ac
+                else MAX_TEMP_C
                 if self._attr_native_temperature_unit == UnitOfTemperature.CELSIUS
                 else MAX_TEMP_F
             )

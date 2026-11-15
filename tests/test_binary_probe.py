@@ -189,5 +189,6 @@ async def test_initial_status_during_subscription_is_not_lost(
         region="CN",
         wait=1,
         protocol="binary",
+        ha_client=False,
     )
     assert await PROBE.probe(args)

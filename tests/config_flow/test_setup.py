@@ -45,6 +45,7 @@ from tests.config_flow.conftest import (
     MAC_B,
     MAC_C,
     GreeEnv,
+    assert_mqtt_status_uses_device_key,
     binds,
     registry_device,
     start_reconfigure,
@@ -69,7 +70,8 @@ async def test_user_setup_with_cloud_and_local(
 
     The cloud lists three units and the LAN scan finds one of them. The user
     picks that one and a cloud-only one. The flow logs in once, binds A over
-    UDP and B over MQTT, and closes its own connections when the entry is made.
+    UDP and queries B over MQTT with its account device key. It closes its own
+    connections when the entry is made.
     """
     host_a = await gree.start_udp(gree.devices[MAC_A])
 
@@ -113,9 +115,9 @@ async def test_user_setup_with_cloud_and_local(
 
     # One login in total, the entry setup uses the stored token
     assert gree.logins == 1
-    # The flow and the entry each bound A and B once
+    # The flow and the entry each bind A over UDP. Cloud B needs no app bind.
     assert binds(gree.devices[MAC_A]) == 2
-    assert binds(gree.devices[MAC_B]) == 2
+    assert binds(gree.devices[MAC_B]) == 0
     assert binds(gree.devices[MAC_C]) == 0
 
     # The flow connected to the broker and closed it again. The entry has
@@ -123,6 +125,9 @@ async def test_user_setup_with_cloud_and_local(
     assert len(gree.broker.clients) == 2
     assert gree.broker.clients[0].exited
     assert len(gree.open_mqtt()) == 1
+    for client in gree.broker.clients:
+        assert client.options["password"] == TOKEN
+        assert_mqtt_status_uses_device_key(client, MAC_B)
     gree.assert_only_entry_connections()
 
 
@@ -314,8 +319,9 @@ async def test_setup_refreshes_a_revoked_token_once(
 
     Regression for the maintainer's report: "Save and reload" right after he
     created a cloud entry raised reauth with bad_credentials, because the
-    broker refused the stored token. Setup now logs in once with the stored account, binds B with the new token
-    and stores it. Storing the token does not reload the entry again.
+    broker refused the stored token. Setup now logs in once with the stored
+    account, queries B with its device key and the new token, and stores it.
+    Storing the token does not reload the entry again.
     """
     gree.revoke_token(NEW_TOKEN)
     await hass.config_entries.async_reload(cloud_entry.entry_id)
@@ -328,10 +334,12 @@ async def test_setup_refreshes_a_revoked_token_once(
 
     assert gree.logins == 1
     assert gree.setup_calls == 1
-    assert binds(gree.devices[MAC_B]) == 1
+    assert binds(gree.devices[MAC_A]) == 1
+    assert binds(gree.devices[MAC_B]) == 0
     assert any("refused the stored token" in line for line in component_logs.warnings())
 
     assert [c.options["password"] for c in gree.open_mqtt()] == [NEW_TOKEN]
+    assert_mqtt_status_uses_device_key(gree.open_mqtt()[0], MAC_B)
     gree.assert_only_entry_connections()
 
 

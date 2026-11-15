@@ -26,6 +26,7 @@ open.
 
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
+import json
 import logging
 from typing import Any
 
@@ -38,6 +39,7 @@ from custom_components.gree_custom.aiogree import (
     transport_mqtt,
     transport_udp,
 )
+from custom_components.gree_custom.aiogree.cipher import EncryptionVersion, get_cipher
 from custom_components.gree_custom.aiogree.cloud_api import GreeRegion
 from custom_components.gree_custom.aiogree.transport_mqtt import GreeMqttTransport
 from custom_components.gree_custom.aiogree.transport_udp import GreeUdpTransport
@@ -186,6 +188,23 @@ def _ids(objects: list[Any]) -> set[int]:
 def binds(device: FakeGreeDevice) -> int:
     """Count the bind requests a device got since its last reset."""
     return sum(1 for pack in device.packs if pack.get("t") == "bind")
+
+
+def assert_mqtt_status_uses_device_key(client: BrokerClient, mac: str) -> None:
+    """Check real status packets with the account key, without generic bind."""
+    requests = [
+        json.loads(payload)
+        for topic, payload in client.published
+        if topic == f"request/{mac}"
+    ]
+    assert requests, "the MQTT client did not request device status"
+    cipher = get_cipher(EncryptionVersion.V1, KEYS[mac])
+    packs = []
+    for envelope in requests:
+        assert isinstance(envelope["pack"], str)
+        packs.append(json.loads(cipher.decrypt(envelope["pack"], None)))
+    assert all(pack.get("t") != "bind" for pack in packs)
+    assert any(pack.get("t") == "status" and pack.get("cols") for pack in packs)
 
 
 @pytest.fixture(autouse=True)

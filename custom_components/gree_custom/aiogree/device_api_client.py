@@ -12,10 +12,12 @@ from .api import (
     StatusResult,
     gree_get_status,
     gree_process_status_pack,
+    gree_set_binary_status,
     gree_set_status,
     gree_try_bind,
 )
 from .binary_ac import BinaryAcError, decode_bin_status
+from .binary_session import BinaryAcSession
 from .cipher import CipherBase, EncryptionVersion, get_cipher
 from .const import (
     MIN_PACK_PROPS,
@@ -23,9 +25,16 @@ from .const import (
     STATUS_CANARY_PROP,
     STATUS_CANARY_PROP_MAX_REQUESTS,
 )
-from .errors import GreeBindingError, GreeConnectionError, GreeError, GreeRuntimeError
+from .errors import (
+    GreeBindingError,
+    GreeConnectionError,
+    GreeError,
+    GreeProtocolError,
+    GreeRuntimeError,
+)
 from .helpers import chunked, gree_decrypt_pack, redact_str
 from .transport import GreeBaseTransport
+from .transport_mqtt import GreeMqttTransport
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -49,6 +58,7 @@ class DeviceApiClient:
 
         self._listeners: list[Callable[[dict[str, str]], None]] = []
         self._binary_status_enabled = False
+        self._binary_ac_session: BinaryAcSession | None = None
 
         # How many columns one status request may carry on this device.
         # Measured once by probe_device_limits() right after binding.
@@ -78,6 +88,7 @@ class DeviceApiClient:
             return
 
         self.controller_mac = controller_mac
+        cloud_binding = self._cloud_binding_info(preferred_version, preferred_key)
 
         _LOGGER.info(
             "[%s:%s] Starting binding procedure", self.controller_mac, self._transport
@@ -95,13 +106,16 @@ class DeviceApiClient:
             or self._transport.get_controller_binding_info(self.controller_mac) is None
         ):
             try:
-                result = await gree_try_bind(
-                    self.controller_mac,
-                    self._userid,
-                    preferred_version,
-                    preferred_key,
-                    self._transport,
-                )
+                if cloud_binding is not None:
+                    result = cloud_binding
+                else:
+                    result = await gree_try_bind(
+                        self.controller_mac,
+                        self._userid,
+                        preferred_version,
+                        preferred_key,
+                        self._transport,
+                    )
 
             except Exception:
                 _LOGGER.exception("Error while binding")
@@ -124,7 +138,29 @@ class DeviceApiClient:
 
         self._available = True
 
-        await self.probe_device_limits()
+        if cloud_binding is None:
+            await self.probe_device_limits()
+        else:
+            self._max_props = None
+
+    def _cloud_binding_info(
+        self,
+        preferred_version: EncryptionVersion | None,
+        preferred_key: str | None,
+    ) -> BindingInfo | None:
+        """Use the account's V1 device key directly on an MQTT subscription."""
+        if (
+            not isinstance(self._transport, GreeMqttTransport)
+            or not preferred_key
+            or not preferred_key.strip()
+            or preferred_version not in (None, EncryptionVersion.V1)
+        ):
+            return None
+        return BindingInfo(
+            preferred_key,
+            EncryptionVersion.V1,
+            get_cipher(EncryptionVersion.V1, preferred_key),
+        )
 
     async def probe_device_limits(self) -> None:
         """Measure how many columns one status request may carry.
@@ -141,6 +177,10 @@ class DeviceApiClient:
         MIN_PACK_PROPS, and the empty status guard in `GreeDevice` deals with
         the rest.
         """
+        if self._binary_ac_session is not None:
+            self._max_props = None
+            return
+
         first = len(POLLED_PROPS)
 
         if await self._probe_columns(first):
@@ -243,17 +283,21 @@ class DeviceApiClient:
 
         self._available = False
         self._max_props = None
+        if self._binary_ac_session is not None:
+            self._binary_ac_session.clear()
 
     async def rebind(self, force_bind: bool = False) -> None:
         """Try binding with the current transport.
 
         If force_bind is false, reuses previous binding info.
         """
+        previous_version = self.encryption_version
+        previous_key = self.encryption_key
         await self.unbind()
         return await self.bind(
             self.controller_mac,
-            self.encryption_version,
-            self.encryption_key,
+            previous_version,
+            previous_key,
             force_bind,
         )
 
@@ -272,6 +316,8 @@ class DeviceApiClient:
     ) -> None:
         """Set the client transport."""
         await self.unbind()
+        self._binary_ac_session = None
+        self._binary_status_enabled = False
         self._transport = transport
 
     #
@@ -331,6 +377,55 @@ class DeviceApiClient:
         if not self._transport:
             raise GreeRuntimeError("No transport set.")
 
+        if self._binary_ac_session is not None:
+            info_names = {prop.value for prop in InfoProp}
+            state_props = [prop for prop in props if prop not in info_names]
+            binary = await self._query_binary_props(state_props)
+            info = await self._query_standard_props(
+                [prop for prop in props if prop in info_names],
+                request_batch,
+                error_as_missing,
+                max_attempts,
+            )
+            return StatusResult(
+                {**binary.prop_values, **info.prop_values},
+                [*binary.missing_props, *info.missing_props],
+            )
+        return await self._query_standard_props(
+            props, request_batch, error_as_missing, max_attempts
+        )
+
+    async def _query_binary_props(self, props: list[str]) -> StatusResult:
+        """Require a new full report for each operational state query."""
+        if not props:
+            return StatusResult({}, [])
+        if self._binary_ac_session is None or self._transport is None:
+            raise GreeRuntimeError("Binary AC status is not configured")
+        try:
+            result = await self._binary_ac_session.query(
+                props,
+                self.controller_mac,
+                self._mac,
+                self._userid,
+                self.cipher,
+                self._transport,
+            )
+        except GreeConnectionError:
+            self._available = False
+            raise
+        self._available = True
+        return result
+
+    async def _query_standard_props(
+        self,
+        props: list[str],
+        request_batch: int,
+        error_as_missing: bool,
+        max_attempts: int | None,
+    ) -> StatusResult:
+        """Query ordinary status fields through the existing JSON API."""
+        if self._transport is None:
+            raise GreeRuntimeError("No transport set")
         state: dict[str, str] = {}
         missing: list[str] = []
 
@@ -394,6 +489,8 @@ class DeviceApiClient:
         values: Mapping[str, int],
     ) -> None:
         """Send the state of multiple properties to the device."""
+        if self._binary_ac_session is not None:
+            raise GreeProtocolError("Binary AC controls must use the matched profile")
         if not self.bound:
             await self.rebind()
 
@@ -422,6 +519,34 @@ class DeviceApiClient:
                 self._available = False
             raise
 
+    async def set_binary_props(
+        self,
+        values: Mapping[str, int],
+        template: bytes,
+        hex6a: bytes,
+    ) -> None:
+        """Send a guarded binary command without assuming its resulting state."""
+        if (
+            self._binary_ac_session is None
+            or not self.bound
+            or not isinstance(self._transport, GreeMqttTransport)
+        ):
+            raise GreeRuntimeError("Binary AC control needs a configured MQTT session")
+        try:
+            await gree_set_binary_status(
+                self.controller_mac,
+                self._mac,
+                self._userid,
+                values,
+                template,
+                hex6a,
+                self.cipher,
+                self._transport,
+            )
+        except GreeConnectionError:
+            self._available = False
+            raise
+
     #
     # Transport Push Messages
     #
@@ -433,6 +558,30 @@ class DeviceApiClient:
         commands or change the normal property requests.
         """
         self._binary_status_enabled = True
+
+    def configure_binary_ac_status(self, timeout: float = 20.0) -> None:
+        """Use full report pushes after the caller has matched the AC profile.
+
+        This changes state queries only. Commands still need a separate model
+        check and a current full snapshot. Cloud Add0.5 is mapped to TemRec
+        for display only; binary writes need their own whole-degree guard.
+        """
+        self._binary_ac_session = BinaryAcSession(timeout)
+        self.enable_binary_status()
+
+    @property
+    def binary_ac_status(self) -> dict[str, str]:
+        """Return a copy of the latest full report, including unknown columns."""
+        if self._binary_ac_session is None:
+            return {}
+        return self._binary_ac_session.status.copy()
+
+    @property
+    def binary_ac_status_revision(self) -> int:
+        """Count full reports accepted by the current binary AC session."""
+        if self._binary_ac_session is None:
+            return 0
+        return self._binary_ac_session.revision
 
     def add_status_listener(
         self,
@@ -465,33 +614,64 @@ class DeviceApiClient:
         if not {"status", "binStatus"}.intersection(topic.split("/")):
             return
 
-        response = gree_decrypt_pack(
-            payload.copy(),
-            self.cipher,
-        )
+        try:
+            response = gree_decrypt_pack(payload.copy(), self.cipher)
+        except GreeError, ValueError, TypeError, KeyError:
+            _LOGGER.debug("Ignoring invalid status envelope")
+            return
 
-        if pack := response.get("pack"):
-            if (
-                self._binary_status_enabled
-                and pack.get("t") == "binStatus"
-                and isinstance(pack.get("binStatus"), str)
-            ):
-                try:
-                    decoded = decode_bin_status(pack["binStatus"])
-                except BinaryAcError:
-                    _LOGGER.debug("Ignoring invalid binary AC status")
-                    return
-                values = {key: str(value) for key, value in decoded.properties.items()}
-            elif "cols" in pack and "dat" in pack:
-                values = gree_process_status_pack(pack, None).prop_values
-            else:
+        pack = response.get("pack")
+        if not isinstance(pack, dict) or pack.get("t") not in (
+            "dat",
+            "status",
+            "binStatus",
+        ):
+            return
+        values = self._decode_status_pack(pack)
+        if values is None:
+            return
+
+        if self._binary_ac_session is not None:
+            if not self._binary_ac_session.accept(values):
                 return
+            self._available = True
+            # Keep diagnostics and guards complete, but limit capabilities.
+            values = self._binary_ac_session.properties()
 
-            for listener in self._listeners:
-                try:
-                    listener(values)
-                except Exception:
-                    _LOGGER.exception("Error during listener execution")
+        for listener in self._listeners:
+            try:
+                listener(values)
+            except Exception:
+                _LOGGER.exception("Error during listener execution")
+
+    def _decode_status_pack(self, pack: dict) -> dict[str, str] | None:
+        """Validate a push before it can update state or wake a waiter."""
+        if (
+            self._binary_status_enabled
+            and pack.get("t") == "binStatus"
+            and isinstance(pack.get("binStatus"), str)
+        ):
+            try:
+                decoded = decode_bin_status(pack["binStatus"])
+            except BinaryAcError:
+                _LOGGER.debug("Ignoring invalid binary AC status")
+                return None
+            return {key: str(value) for key, value in decoded.properties.items()}
+        cols, data = pack.get("cols"), pack.get("dat")
+        if not isinstance(cols, list) or not isinstance(data, list):
+            return None
+        if len(cols) != len(data) or len(set(map(str, cols))) != len(cols):
+            return None
+        if any(not isinstance(key, str) for key in cols):
+            return None
+        if any(
+            isinstance(value, bool) or not isinstance(value, (str, int, list))
+            for value in data
+        ):
+            return None
+        # Full cloud reports include array-valued fault columns. Keep the
+        # normal parser's string form instead of dropping the whole report.
+        return gree_process_status_pack(pack, None).prop_values
 
     #
     # Properties

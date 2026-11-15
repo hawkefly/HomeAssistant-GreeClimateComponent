@@ -8,6 +8,8 @@
 [![Validate](https://github.com/RobHofmann/HomeAssistant-GreeClimateComponent/actions/workflows/validate.yaml/badge.svg)](https://github.com/RobHofmann/HomeAssistant-GreeClimateComponent/actions/workflows/validate.yaml)
 [![Lint](https://github.com/RobHofmann/HomeAssistant-GreeClimateComponent/actions/workflows/lint.yml/badge.svg)](https://github.com/RobHofmann/HomeAssistant-GreeClimateComponent/actions/workflows/lint.yml)
 
+> This experimental branch adds a limited China cloud profile for WB05-TG V1.30 devices. See [tested behavior, setup and limits](docs/experimental-wb05-tg.md).
+
 Gree integration for Home Assistant. It controls Gree air conditioners, and the many brands that use the Gree protocol, over your local network or through the Gree cloud.
 
 [![Join our Discord](https://img.shields.io/badge/Discord-Join%20the%20chat-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/JPcBkvRhTS)
